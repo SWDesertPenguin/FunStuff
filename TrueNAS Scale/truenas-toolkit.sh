@@ -11,6 +11,7 @@
 # Commands:
 #   full        - Generate complete truenas_config.md
 #   diag        - Quick diagnostic summary (paste into chat)
+#   sanitize    - Sanitize an existing file (redact sensitive data)
 #   system      - System info (CPU, RAM, OS, uptime)
 #   pools       - Pool status and dataset usage
 #   disks       - Disk inventory and SMART health
@@ -929,9 +930,313 @@ generate_diag() {
   echo "_For full details, run: \`./truenas-toolkit.sh full\`_"
 }
 
+# ── Sanitization Module ─────────────────────────────────────────────────────
+
+# Sanitization tracking - maps original values to redacted replacements
+declare -A SANITIZE_MAP
+
+sanitize_serial_numbers() {
+  local file="$1"
+  local count=0
+  local -A seen
+
+  # Catch serial numbers from disk table rows and serial fields
+  while IFS= read -r serial; do
+    [[ -z "$serial" || "$serial" == "N/A" || "$serial" == "null" ]] && continue
+    [[ -n "${seen[$serial]+x}" ]] && continue
+    seen["$serial"]=1
+    count=$((count + 1))
+    local redacted="SERIAL-REDACTED-$(printf '%03d' $count)"
+    SANITIZE_MAP["$serial"]="$redacted"
+    sed -i "s|${serial}|${redacted}|g" "$file"
+  done < <(
+    # Serials in table columns (6-20 char alphanumeric between pipes)
+    grep -oP '(?<=\| )[A-Z0-9]{6,20}(?= \|)' "$file" 2>/dev/null
+    # Serials near the word "serial"
+    grep -iP 'serial' "$file" 2>/dev/null | grep -oP '[A-Z0-9_-]{8,}'
+  )
+
+  echo "  Redacted $count serial number(s)" >&2
+}
+
+sanitize_ip_addresses() {
+  local file="$1"
+  local scope="$2"  # "all", "public", "private"
+  local pub_count=0 priv_count=0
+
+  local -a all_ips
+  mapfile -t all_ips < <(grep -oP '\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b' "$file" | sort -u)
+
+  for ip in "${all_ips[@]}"; do
+    [[ -z "$ip" ]] && continue
+    [[ -n "${SANITIZE_MAP[$ip]+x}" ]] && continue
+
+    local is_private=false
+    [[ "$ip" =~ ^10\. ]] && is_private=true
+    [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] && is_private=true
+    [[ "$ip" =~ ^192\.168\. ]] && is_private=true
+    [[ "$ip" =~ ^127\. ]] && is_private=true
+    [[ "$ip" =~ ^169\.254\. ]] && is_private=true
+
+    if ! $is_private && [[ "$scope" == "all" || "$scope" == "public" ]]; then
+      pub_count=$((pub_count + 1))
+      local redacted="WAN-IP-REDACTED-$(printf '%03d' $pub_count)"
+      SANITIZE_MAP["$ip"]="$redacted"
+      sed -i "s|${ip}|${redacted}|g" "$file"
+    elif $is_private && [[ "$scope" == "all" || "$scope" == "private" ]]; then
+      priv_count=$((priv_count + 1))
+      local redacted="PRIV-IP-REDACTED-$(printf '%03d' $priv_count)"
+      SANITIZE_MAP["$ip"]="$redacted"
+      sed -i "s|${ip}|${redacted}|g" "$file"
+    fi
+  done
+
+  local total=$((pub_count + priv_count))
+  echo "  Redacted $total IP address(es) (scope: $scope — $pub_count public, $priv_count private)" >&2
+}
+
+sanitize_mac_addresses() {
+  local file="$1"
+  local count=0
+
+  while IFS= read -r mac; do
+    [[ -z "$mac" ]] && continue
+    [[ -n "${SANITIZE_MAP[$mac]+x}" ]] && continue
+    count=$((count + 1))
+    # Preserve OUI prefix (first 3 octets) for vendor ID, redact device portion
+    local prefix="${mac:0:8}"
+    local redacted="${prefix}:XX:XX:$(printf '%02X' $count)"
+    SANITIZE_MAP["$mac"]="$redacted"
+    sed -i "s|${mac}|${redacted}|gi" "$file"
+  done < <(grep -oiP '([0-9a-f]{2}:){5}[0-9a-f]{2}' "$file" | sort -u)
+
+  echo "  Redacted $count MAC address(es) (OUI vendor prefix preserved)" >&2
+}
+
+sanitize_hostname() {
+  local file="$1"
+  local hostname
+  hostname=$(grep -m1 'Hostname' "$file" | grep -oP '(?<=\| )[^ |]+(?= \|)' | tail -1 || true)
+
+  if [[ -n "$hostname" && "$hostname" != "N/A" && "$hostname" != "**Hostname**" ]]; then
+    SANITIZE_MAP["$hostname"]="HOSTNAME-REDACTED"
+    sed -i "s|${hostname}|HOSTNAME-REDACTED|g" "$file"
+    echo "  Redacted hostname ($hostname)" >&2
+  else
+    echo "  No hostname found to redact" >&2
+  fi
+}
+
+sanitize_share_paths() {
+  local file="$1"
+  local count=0
+
+  while IFS= read -r path; do
+    [[ -z "$path" || "$path" == "N/A" ]] && continue
+    [[ -n "${SANITIZE_MAP[$path]+x}" ]] && continue
+    count=$((count + 1))
+    local redacted="/mnt/POOL-REDACTED/share-$(printf '%03d' $count)"
+    SANITIZE_MAP["$path"]="$redacted"
+    sed -i "s|${path}|${redacted}|g" "$file"
+  done < <(grep -oP '/mnt/[A-Za-z0-9/_-]+' "$file" | sort -u)
+
+  echo "  Redacted $count share/dataset path(s)" >&2
+}
+
+sanitize_pool_dataset_names() {
+  local file="$1"
+
+  echo -e "${CYAN}  Enter pool/dataset names to redact (comma-separated, or 'skip'):${RESET}" >&2
+  read -r -p "  > " names_input
+
+  if [[ "$names_input" == "skip" || -z "$names_input" ]]; then
+    echo "  Skipped pool/dataset name redaction" >&2
+    return
+  fi
+
+  local count=0
+  IFS=',' read -ra names <<< "$names_input"
+  for name in "${names[@]}"; do
+    name=$(echo "$name" | xargs)
+    [[ -z "$name" ]] && continue
+    count=$((count + 1))
+    local redacted="POOL-REDACTED-$(printf '%03d' $count)"
+    SANITIZE_MAP["$name"]="$redacted"
+    sed -i "s|${name}|${redacted}|g" "$file"
+  done
+
+  echo "  Redacted $count pool/dataset name(s)" >&2
+}
+
+sanitize_usernames() {
+  local file="$1"
+
+  echo -e "${CYAN}  Enter usernames to redact (comma-separated, or 'skip'):${RESET}" >&2
+  read -r -p "  > " names_input
+
+  if [[ "$names_input" == "skip" || -z "$names_input" ]]; then
+    echo "  Skipped username redaction" >&2
+    return
+  fi
+
+  local count=0
+  IFS=',' read -ra names <<< "$names_input"
+  for name in "${names[@]}"; do
+    name=$(echo "$name" | xargs)
+    [[ -z "$name" ]] && continue
+    count=$((count + 1))
+    local redacted="USER-REDACTED-$(printf '%03d' $count)"
+    SANITIZE_MAP["$name"]="$redacted"
+    sed -i "s|${name}|${redacted}|g" "$file"
+  done
+
+  echo "  Redacted $count username(s)" >&2
+}
+
+sanitize_custom() {
+  local file="$1"
+
+  echo -e "${CYAN}  Enter custom strings to redact (comma-separated, or 'skip'):${RESET}" >&2
+  read -r -p "  > " custom_input
+
+  if [[ "$custom_input" == "skip" || -z "$custom_input" ]]; then
+    echo "  Skipped custom redaction" >&2
+    return
+  fi
+
+  local count=0
+  IFS=',' read -ra items <<< "$custom_input"
+  for item in "${items[@]}"; do
+    item=$(echo "$item" | xargs)
+    [[ -z "$item" ]] && continue
+    count=$((count + 1))
+    local redacted="CUSTOM-REDACTED-$(printf '%03d' $count)"
+    SANITIZE_MAP["$item"]="$redacted"
+    sed -i "s|${item}|${redacted}|g" "$file"
+  done
+
+  echo "  Redacted $count custom string(s)" >&2
+}
+
+write_redaction_log() {
+  local file="$1"
+  local log_file="${file%.md}-redaction-log.txt"
+
+  echo "" >&2
+  echo -e "${CYAN}Save redaction map to ${log_file}?${RESET}" >&2
+  echo -e "${DIM}  Maps REDACTED values back to originals — keep this private!${RESET}" >&2
+  read -r -p "  Save redaction log? [y/N] > " save_log
+
+  if [[ "$save_log" =~ ^[Yy] ]]; then
+    {
+      echo "# Redaction Log - $(now)"
+      echo "# Source: $file"
+      echo "# ⚠️  WARNING: Contains sensitive data. Do NOT share."
+      echo ""
+      echo "| Redacted | Original |"
+      echo "|----------|----------|"
+      for orig in "${!SANITIZE_MAP[@]}"; do
+        echo "| ${SANITIZE_MAP[$orig]} | $orig |"
+      done
+    } > "$log_file"
+    echo -e "  ${GREEN}Saved: $log_file${RESET}" >&2
+    echo -e "  ${YELLOW}⚠️  Keep this file private!${RESET}" >&2
+  else
+    echo "  Redaction log not saved" >&2
+  fi
+}
+
+interactive_sanitize() {
+  local file="$1"
+
+  if [[ ! -f "$file" ]]; then
+    err "File not found: $file"
+    return 1
+  fi
+
+  # Only prompt if interactive terminal
+  if [[ ! -t 0 ]]; then
+    info "Non-interactive mode — skipping sanitization"
+    return 0
+  fi
+
+  echo "" >&2
+  echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}" >&2
+  echo -e "${BOLD}  Sanitization Options${RESET}" >&2
+  echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}" >&2
+  echo "" >&2
+  echo -e "  File: ${CYAN}$file${RESET}" >&2
+  echo "" >&2
+  echo -e "  ${GREEN}1${RESET}) Disk serial numbers" >&2
+  echo -e "  ${GREEN}2${RESET}) Public (WAN) IP addresses only" >&2
+  echo -e "  ${GREEN}3${RESET}) All IP addresses (public + private)" >&2
+  echo -e "  ${GREEN}4${RESET}) MAC addresses (preserves vendor prefix)" >&2
+  echo -e "  ${GREEN}5${RESET}) Hostname" >&2
+  echo -e "  ${GREEN}6${RESET}) Share/dataset paths" >&2
+  echo -e "  ${GREEN}7${RESET}) Pool/dataset names (you type them)" >&2
+  echo -e "  ${GREEN}8${RESET}) Usernames (you type them)" >&2
+  echo -e "  ${GREEN}9${RESET}) Custom strings (you type them)" >&2
+  echo "" >&2
+  echo -e "  ${YELLOW}A${RESET}) All automatic (1-6)" >&2
+  echo -e "  ${YELLOW}F${RESET}) Full sanitize (1-9, prompts for 7-9)" >&2
+  echo -e "  ${YELLOW}S${RESET}) Skip — keep file as-is" >&2
+  echo "" >&2
+
+  read -r -p "  Enter choices (e.g. 1,2,4 or A or F or S) > " choices
+
+  if [[ "$choices" =~ ^[Ss]$ || -z "$choices" ]]; then
+    echo -e "  ${DIM}Skipping sanitization${RESET}" >&2
+    return 0
+  fi
+
+  # Expand shortcuts
+  [[ "$choices" =~ ^[Aa]$ ]] && choices="1,2,4,5,6"
+  [[ "$choices" =~ ^[Ff]$ ]] && choices="1,2,4,5,6,7,8,9"
+
+  echo "" >&2
+  echo -e "${BOLD}Sanitizing...${RESET}" >&2
+
+  # Backup
+  cp "$file" "${file}.bak"
+  echo -e "  ${DIM}Backup: ${file}.bak${RESET}" >&2
+  echo "" >&2
+
+  IFS=',' read -ra selected <<< "$choices"
+  for choice in "${selected[@]}"; do
+    choice=$(echo "$choice" | xargs)
+    case "$choice" in
+      1) sanitize_serial_numbers "$file" ;;
+      2) sanitize_ip_addresses "$file" "public" ;;
+      3) sanitize_ip_addresses "$file" "all" ;;
+      4) sanitize_mac_addresses "$file" ;;
+      5) sanitize_hostname "$file" ;;
+      6) sanitize_share_paths "$file" ;;
+      7) sanitize_pool_dataset_names "$file" ;;
+      8) sanitize_usernames "$file" ;;
+      9) sanitize_custom "$file" ;;
+      *) echo "  Unknown option: $choice (skipping)" >&2 ;;
+    esac
+  done
+
+  echo "" >&2
+  echo -e "${BOLD}Sanitization complete.${RESET}" >&2
+  echo -e "  Total redactions: ${#SANITIZE_MAP[@]}" >&2
+  echo -e "  Sanitized file:   ${GREEN}$file${RESET}" >&2
+  echo -e "  Original backup:  ${DIM}${file}.bak${RESET}" >&2
+
+  if [[ ${#SANITIZE_MAP[@]} -gt 0 ]]; then
+    write_redaction_log "$file"
+  fi
+
+  echo "" >&2
+  echo -e "${DIM}Restore original:  mv ${file}.bak $file${RESET}" >&2
+  echo -e "${DIM}Delete backup:     rm ${file}.bak${RESET}" >&2
+}
+
 # ── Argument Parsing ────────────────────────────────────────────────────────
 
 # Parse flags
+SKIP_SANITIZE=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --remote|-r)
@@ -945,6 +1250,10 @@ while [[ $# -gt 0 ]]; do
     --api-key)
       TRUENAS_API_KEY="$2"
       shift 2
+      ;;
+    --no-sanitize)
+      SKIP_SANITIZE=true
+      shift
       ;;
     --output|-o)
       OUTPUT_FILE="$2"
@@ -965,12 +1274,24 @@ while [[ $# -gt 0 ]]; do
 done
 
 COMMAND="${1:-help}"
+COMMAND_ARG="${2:-}"
 
 # Execute
 run_command() {
   case "$COMMAND" in
     full)       generate_full_md ;;
     diag)       generate_diag ;;
+    sanitize)
+      # Standalone sanitize: sanitize an existing file
+      local target="${COMMAND_ARG:-$MD_FILE}"
+      if [[ ! -f "$target" ]]; then
+        err "File not found: $target"
+        echo "Usage: $0 sanitize [filename]  (default: $MD_FILE)"
+        exit 1
+      fi
+      interactive_sanitize "$target"
+      exit 0
+      ;;
     system)     collect_system ;;
     pools)      collect_pools ;;
     disks)      collect_disks ;;
@@ -994,6 +1315,7 @@ run_command() {
       echo "Commands:"
       echo "  full         Generate complete truenas_config.md"
       echo "  diag         Quick diagnostic summary (paste into chat)"
+      echo "  sanitize     Sanitize an existing file (default: truenas_config.md)"
       echo "  system       System info (CPU, RAM, OS, uptime)"
       echo "  pools        Pool status and dataset usage"
       echo "  disks        Disk inventory"
@@ -1017,6 +1339,7 @@ run_command() {
       echo "  --api-key KEY      API key (default: \$TRUENAS_API_KEY)"
       echo "  -o, --output FILE  Write output to file instead of stdout"
       echo "  --md-file FILE     Filename for full markdown (default: truenas_config.md)"
+      echo "  --no-sanitize      Skip sanitization prompt"
       echo ""
       echo "Examples:"
       echo "  # SSH into TrueNAS and generate full doc:"
@@ -1031,6 +1354,12 @@ run_command() {
       echo "  # Check just alerts and services:"
       echo "  ./truenas-toolkit.sh alerts"
       echo "  ./truenas-toolkit.sh services"
+      echo ""
+      echo "  # Sanitize an existing file:"
+      echo "  ./truenas-toolkit.sh sanitize truenas_config.md"
+      echo ""
+      echo "  # Generate without sanitization prompt:"
+      echo "  ./truenas-toolkit.sh --no-sanitize -o truenas_config.md full"
       ;;
     *)
       err "Unknown command: $COMMAND"
@@ -1043,6 +1372,35 @@ run_command() {
 if [[ -n "$OUTPUT_FILE" ]]; then
   run_command > "$OUTPUT_FILE"
   info "Output written to $OUTPUT_FILE"
+  # Offer sanitization for file output
+  if ! $SKIP_SANITIZE && [[ "$COMMAND" == "full" || "$COMMAND" == "diag" ]]; then
+    interactive_sanitize "$OUTPUT_FILE"
+  fi
+elif [[ "$COMMAND" == "full" || "$COMMAND" == "diag" ]]; then
+  # For full/diag without -o, write to default file and offer sanitization
+  DEFAULT_OUT="$MD_FILE"
+  [[ "$COMMAND" == "diag" ]] && DEFAULT_OUT="truenas_diag_$(date +%Y%m%d_%H%M%S).md"
+
+  if [[ -t 1 ]]; then
+    # Interactive terminal — ask about file output
+    echo "" >&2
+    echo -e "${CYAN}Write output to file for sanitization?${RESET}" >&2
+    read -r -p "  Filename (enter for '$DEFAULT_OUT', 'n' to print to stdout only) > " file_choice
+
+    if [[ "$file_choice" =~ ^[Nn]$ ]]; then
+      run_command
+    else
+      [[ -n "$file_choice" ]] && DEFAULT_OUT="$file_choice"
+      run_command > "$DEFAULT_OUT"
+      info "Output written to $DEFAULT_OUT"
+      if ! $SKIP_SANITIZE; then
+        interactive_sanitize "$DEFAULT_OUT"
+      fi
+    fi
+  else
+    # Non-interactive (piped) — just output to stdout
+    run_command
+  fi
 else
   run_command
 fi
